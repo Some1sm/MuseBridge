@@ -1102,6 +1102,23 @@ def is_title_generation_query(prompt: str) -> bool:
     )
 
 
+def generate_local_session_title(text: str) -> str:
+    """Generate a clean, concise 3-5 word title locally from Claude Code's session prompt."""
+    m = re.search(r"<session>(.*?)</session>", text, flags=re.DOTALL)
+    raw = m.group(1).strip() if m else text.strip()
+    raw = re.sub(r"^(?:please\s+|can\s+you\s+|could\s+you\s+|i\s+want\s+to\s+)", "", raw, flags=re.IGNORECASE)
+    m_fn = re.search(r"\b([a-zA-Z0-9_\-]+\.[a-zA-Z0-9_]{1,6})\b", raw)
+    words = [w for w in raw.split() if w]
+    if len(words) <= 5:
+        title = " ".join(words)
+    elif m_fn:
+        title = f"{words[0].capitalize()} {m_fn.group(1)}"
+    else:
+        title = " ".join(words[:5])
+    title = title.strip()[:50]
+    return title[0].upper() + title[1:] if title else "Coding Session"
+
+
 def is_dump_all_contents_query(text: str) -> bool:
     """Check if user prompt asks to output/read the contents of existing local files in the current folder."""
     t = text.strip().lower()
@@ -1508,7 +1525,10 @@ def is_code_line(line: str) -> bool:
     return any(s.startswith(p) for p in code_starts)
 
 
-def is_workspace_promise(text: str) -> bool:
+ALL_LANG_TAGS: set = set(LANG_EXT_MAP.keys()) | {alias for aliases in LANG_EXT_MAP.values() for alias in aliases} | {"shell", "diff", "patch", "dockerfile", "xml", "toml"}
+
+
+def is_workspace_promise(text: str, default_fname: str = "") -> bool:
     """Detect if Muse is hallucinating an internal ~/workspace container or background runner without emitting code."""
     t = text.lower()
     has_workspace = bool(
@@ -1520,7 +1540,7 @@ def is_workspace_promise(text: str) -> bool:
     if not has_workspace:
         return False
     # If the response already contains code blocks or file cards, it's not an empty promise
-    _, files = parse_cards_and_fences(text)
+    _, files = parse_cards_and_fences(text, default_fname=default_fname)
     return len(files) == 0
 
 
@@ -1557,13 +1577,14 @@ def clean_bottom_card_content(content: str) -> Tuple[str, str]:
     return "\n\n".join(intro_parts).strip(), "\n\n".join(code_parts).strip()
 
 
-def parse_cards_and_fences(block: str) -> Tuple[str, List[Tuple[str, str]]]:
+def parse_cards_and_fences(block: str, default_fname: str = "") -> Tuple[str, List[Tuple[str, str]]]:
     """
     Extract generated files from a response block, supporting:
     1. Single or multiple Muse native file cards:
        - Top-headed: <filename>\n<TAG>\n<code>
        - Bottom-tagged: <code>\n<filename>\n<TAG>
     2. Markdown code fences with filenames in header, info string, or first line comment.
+    3. Muse web code block widgets rendered with a language badge (<lang_tag>\n<content>).
     Returns: (thought_commentary, [(filename, content), ...])
     """
     found_files: List[Tuple[str, str]] = []
@@ -1650,6 +1671,9 @@ def parse_cards_and_fences(block: str) -> Tuple[str, List[Tuple[str, str]]]:
                     fname = m_first.group(1)
                     content = "\n".join(content.splitlines()[1:]).strip()
 
+            if not fname and default_fname:
+                fname = default_fname
+
             if fname and fname not in [f[0] for f in found_files]:
                 found_files.append((fname, content))
 
@@ -1657,6 +1681,30 @@ def parse_cards_and_fences(block: str) -> Tuple[str, List[Tuple[str, str]]]:
             cleaned = re.sub(r"```[a-zA-Z0-9_+\-]*.*?\n+.*?\n+```", "", block, flags=re.DOTALL).strip()
             if cleaned:
                 thoughts.append(cleaned)
+
+    # 3. If no native cards or fences, check Muse web code block widgets (<lang_tag>\n<content>)
+    if not found_files:
+        lines = block.splitlines()
+        for i, line in enumerate(lines):
+            tag = line.strip().lower()
+            if tag in ALL_LANG_TAGS and i + 1 < len(lines):
+                code_lines = lines[i + 1:]
+                code_content = "\n".join(code_lines).strip()
+                intro_lines = lines[:i]
+                intro_text = "\n".join(intro_lines).strip()
+
+                fname = default_fname
+                m_fn = re.search(r"[`\"']?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]{1,6})[`\"']?", intro_text)
+                if m_fn:
+                    cand = m_fn.group(1)
+                    if "." in cand and len(cand.split(".")[-1]) <= 6:
+                        fname = cand
+
+                if fname and code_content:
+                    found_files.append((fname, code_content))
+                    if intro_text:
+                        thoughts.append(intro_text)
+                    break
 
     thought_str = "\n\n".join(thoughts).strip()
     return thought_str, found_files
@@ -1668,7 +1716,7 @@ def parse_single_card(block: str) -> Optional[Tuple[str, str]]:
     return files[0] if files else None
 
 
-def _detect_tool_calls(reply: str, tool_names: set, cwd: str) -> Tuple[str, List[Tuple[str, dict]]]:
+def _detect_tool_calls(reply: str, tool_names: set, cwd: str, default_fname: str = "") -> Tuple[str, List[Tuple[str, dict]]]:
     """
     Detect if Muse's reply represents actions to execute on the local computer
     (e.g., creating files, executing commands, reading files), or if Muse inspected
@@ -1710,7 +1758,7 @@ def _detect_tool_calls(reply: str, tool_names: set, cwd: str) -> Tuple[str, List
     if "<!-- bubble -->" in clean_reply:
         blocks = [b.strip() for b in clean_reply.split("<!-- bubble -->") if b.strip()]
     else:
-        blocks = [b.strip() for b in re.split(r"\n{2,}", clean_reply) if b.strip()]
+        blocks = [clean_reply]
 
     write_tool_name = "Write" if "Write" in tool_names else ("FileWrite" if "FileWrite" in tool_names else None)
 
@@ -1763,7 +1811,7 @@ def _detect_tool_calls(reply: str, tool_names: set, cwd: str) -> Tuple[str, List
             continue
 
         # Check Muse native file cards and markdown code fences
-        block_thought, found_files = parse_cards_and_fences(block)
+        block_thought, found_files = parse_cards_and_fences(block, default_fname=default_fname)
         if found_files and write_tool_name:
             if block_thought:
                 thoughts.append(block_thought)
@@ -2057,6 +2105,65 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                         })
                     return
 
+                # Intercept Claude Code automated session title requests.
+                # Generating titles locally avoids polluting the Muse thread with <session> tags,
+                # prevents Muse from executing the title prompt instead of the actual user task,
+                # and saves an entire round-trip latency turn.
+                if is_title_generation_query(last_user_msg):
+                    title_text = generate_local_session_title(last_user_msg)
+                    print(f"[*] Intercepted Claude Code session title request; returning '{title_text}' locally.", file=sys.stderr, flush=True)
+                    if is_stream:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+
+                        self._send_sse("message_start", {
+                            "type": "message_start",
+                            "message": {
+                                "id": msg_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                                "model": model_name,
+                                "stop_reason": None,
+                                "stop_sequence": None,
+                                "usage": {"input_tokens": 15, "output_tokens": len(title_text.split())},
+                            },
+                        })
+                        self._send_sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                        self._send_sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": title_text},
+                        })
+                        self._send_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+                        self._send_sse("message_delta", {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                            "usage": {"output_tokens": len(title_text.split())},
+                        })
+                        self._send_sse("message_stop", {"type": "message_stop"})
+                        self.close_connection = True
+                    else:
+                        self._send_json(200, {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": title_text}],
+                            "model": model_name,
+                            "stop_reason": "end_turn",
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 15, "output_tokens": len(title_text.split())},
+                        })
+                    return
+
                 stream_headers_sent = [False]
 
                 def send_with_keepalive(prompt: str, cwd: str) -> Tuple[str, List[str]]:
@@ -2273,6 +2380,9 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                     f"so the harness can immediately create the files on the user's PC.]"
                                 )
 
+                            m_target = re.search(r"\b(?:create|make|write|named|file|add|save)\s+[`\"']?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]{1,6})[`\"']?", clean_last_user_msg, flags=re.IGNORECASE)
+                            default_fname = m_target.group(1) if m_target else ""
+
                             try:
                                 reply, extracted_files = send_with_keepalive(prompt_to_send, cwd=cwd)
                             except Exception as e:
@@ -2282,7 +2392,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                             # Check if Muse hallucinated putting files into ~/workspace or background execution
                             if not is_title_generation_query(clean_last_user_msg):
                                 for retry_attempt in range(2):
-                                    if not is_workspace_promise(reply) or extracted_files:
+                                    if not is_workspace_promise(reply, default_fname=default_fname) or extracted_files:
                                         break
                                     print(f"[*] Detected workspace promise from Muse (attempt {retry_attempt + 1}/2); automatically re-prompting for direct code output...", file=sys.stderr, flush=True)
                                     is_multi_file_project = bool(
@@ -2326,7 +2436,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                     f"All files are saved to disk and ready to use."
                                 )
 
-                            thought, tools_to_emit = _detect_tool_calls(reply, tool_names, cwd)
+                            thought, tools_to_emit = _detect_tool_calls(reply, tool_names, cwd, default_fname=default_fname)
                             if not tools_to_emit and is_edit_request and target_file_info and ("Write" in tool_names or "FileWrite" in tool_names):
                                 clean_sol = reply.strip()
                                 m_fence = re.search(r"^```(?:[a-zA-Z0-9_\-]+)?\n+(.*?)\n+```$", clean_sol, flags=re.DOTALL)
