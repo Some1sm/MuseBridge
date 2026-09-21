@@ -871,25 +871,42 @@ def _extract_archive(archive_path: Path, cwd: str) -> List[str]:
     return extracted_names
 
 
-def _download_and_extract_recent_archives(page: Page, cwd: str) -> List[str]:
-    """Detect downloadable archive cards attached by Muse, download and extract to cwd."""
+_DOWNLOADED_ARCHIVES: set = set()
+
+
+def _download_and_extract_recent_archives(page: Page, cwd: str, n_before: int = 0) -> List[str]:
+    """Detect downloadable archive cards attached by Muse in the current turn, download and extract to cwd."""
     if not cwd or not os.path.isdir(cwd):
         return []
 
     extracted: List[str] = []
     try:
-        # Check for sandbox file card options buttons
-        options_btns = page.locator("[data-testid='hatch-sandbox-file-card-options']")
-        if options_btns.count() == 0:
+        msg_sel = ".hatch-chat-groupable-bubble"
+        all_bubbles = page.locator(msg_sel)
+        total_bubbles = all_bubbles.count()
+        if total_bubbles == 0:
             return []
 
-        options_btn = options_btns.last
-        if not options_btn.is_visible():
+        # Only look inside newly generated bubbles from this turn
+        start_idx = max(0, n_before) if n_before < total_bubbles else max(0, total_bubbles - 1)
+        target_bubbles = [all_bubbles.nth(i) for i in range(start_idx, total_bubbles)]
+
+        options_btn = None
+        for b in reversed(target_bubbles):
+            btns = b.locator("[data-testid='hatch-sandbox-file-card-options']")
+            if btns.count() > 0 and btns.last.is_visible():
+                options_btn = btns.last
+                break
+
+        if not options_btn:
             return []
 
         card_container = options_btn.locator("xpath=./ancestor::span[contains(@class, 'rounded') or contains(@class, 'hatch-chat-groupable-bubble')][1]")
         card_text = card_container.inner_text().lower() if card_container.count() > 0 else ""
         if not any(ext in card_text for ext in (".tar", ".zip", ".tgz", ".gz", "archive")):
+            return []
+
+        if any(arch in card_text for arch in _DOWNLOADED_ARCHIVES):
             return []
 
         print("[*] Detected downloadable project archive in Muse chat; triggering download...", file=sys.stderr, flush=True)
@@ -913,6 +930,9 @@ def _download_and_extract_recent_archives(page: Page, cwd: str) -> List[str]:
         if suggested_name:
             archive_path = tmp_dir / suggested_name
         dl.save_as(str(archive_path))
+        _DOWNLOADED_ARCHIVES.add(archive_path.name.lower())
+        if suggested_name:
+            _DOWNLOADED_ARCHIVES.add(suggested_name.lower())
         print(f"[*] Successfully downloaded archive: {archive_path.name} ({archive_path.stat().st_size} bytes)", file=sys.stderr, flush=True)
 
         extracted = _extract_archive(archive_path, cwd)
@@ -989,7 +1009,7 @@ class BrowserManager:
                             _fill_composer(page, composer_sel, text)
                             _click_send(page, send_sel, composer_sel)
                             reply = _wait_for_reply(page, msg_sel, n_before, timeout_s=timeout_s, prompt_text=text)
-                            extracted = _download_and_extract_recent_archives(page, req_cwd)
+                            extracted = _download_and_extract_recent_archives(page, req_cwd, n_before=n_before)
                             res_q.put(("ok", (reply, extracted)))
                         except Exception as ex:
                             res_q.put(("error", str(ex)))
@@ -1069,6 +1089,17 @@ def strip_system_tags(text: str) -> str:
     cleaned = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
     cleaned = re.sub(r"<pasted_content[^>]*>(.*?)</pasted_content[^>]*>", r"\1", cleaned, flags=re.DOTALL)
     return cleaned.strip()
+
+
+def is_title_generation_query(prompt: str) -> bool:
+    """Detect if prompt is an automated session title generation query (Claude Code, Continue, etc.)."""
+    p_lower = prompt.lower()
+    return bool(
+        "<session>" in p_lower
+        or "write the title in the predominant language" in p_lower
+        or ("session title" in p_lower and "title:" in p_lower)
+        or re.search(r"\b(?:generate|write|create)\s+(?:a\s+)?(?:short\s+)?(?:session\s+)?title\b", p_lower)
+    )
 
 
 def is_dump_all_contents_query(text: str) -> bool:
@@ -1493,6 +1524,39 @@ def is_workspace_promise(text: str) -> bool:
     return len(files) == 0
 
 
+def clean_bottom_card_content(content: str) -> Tuple[str, str]:
+    """Separate introductory conversational text from the actual content of a bottom-tagged card."""
+    parts = re.split(r"\n{2,}", content.strip())
+    if len(parts) <= 1:
+        return "", content.strip()
+
+    split_idx = 0
+    prose_markers = [
+        r"(?:grab it here|here is|here's|here are|created (?:in|inside) (?:my )?workspace|check it out|one note|note:)\s*:?$",
+        r":\s*$",
+    ]
+    for i, p in enumerate(parts):
+        p_clean = p.strip()
+        is_intro = False
+        p_lines = [l.strip() for l in p_clean.splitlines() if l.strip()]
+        last_line = p_lines[-1] if p_lines else ""
+        for pat in prose_markers:
+            if re.search(pat, last_line, re.IGNORECASE):
+                is_intro = True
+                break
+        if not is_intro:
+            if re.search(r"^(?:done|created|already done|sure|okay|here)\b.*?\b(?:workspace|pc|hands)\b", p_clean, re.IGNORECASE):
+                is_intro = True
+            elif p_clean.startswith('"') and p_clean.endswith('"') and i < len(parts) - 1:
+                is_intro = True
+        if is_intro:
+            split_idx = i + 1
+
+    intro_parts = parts[:split_idx]
+    code_parts = parts[split_idx:] if split_idx < len(parts) else parts[-1:]
+    return "\n\n".join(intro_parts).strip(), "\n\n".join(code_parts).strip()
+
+
 def parse_cards_and_fences(block: str) -> Tuple[str, List[Tuple[str, str]]]:
     """
     Extract generated files from a response block, supporting:
@@ -1517,51 +1581,41 @@ def parse_cards_and_fences(block: str) -> Tuple[str, List[Tuple[str, str]]]:
 
     if matches:
         first_i, first_fname, first_tag = matches[0]
-        after_code = False
-        if first_i + 2 < len(lines):
-            for j in range(first_i + 2, min(len(lines), first_i + 6)):
-                if is_code_line(lines[j]):
-                    after_code = True
-                    break
+        lines_after = len(lines) - (first_i + 2)
+        lines_before = first_i
 
-        if after_code:
+        is_top_headed = False
+        if lines_after > 0:
+            if lines_before <= 2:
+                is_top_headed = True
+            elif lines_after > lines_before:
+                is_top_headed = True
+
+        if is_top_headed:
             # Case A: Filename and TAG are at the TOP of code
             intro_lines = lines[:first_i]
-            clean_intro = []
-            for l in intro_lines:
-                if not re.match(r"^[a-zA-Z0-9_.\-\\/]+\.[a-zA-Z0-9_]+$", l.strip()):
-                    clean_intro.append(l)
+            clean_intro = [l for l in intro_lines if not re.match(r"^[a-zA-Z0-9_.\-\\/]+\.[a-zA-Z0-9_]+$", l.strip())]
             if clean_intro:
                 thoughts.append("\n".join(clean_intro).strip())
 
-            raw_code = lines[first_i + 2:]
-            idx = len(raw_code) - 1
-            while idx >= 0 and not is_code_line(raw_code[idx]):
-                idx -= 1
-            final_code = raw_code[:idx + 1]
-            trailing = raw_code[idx + 1:]
-
-            if trailing:
-                trailing_txt = "\n".join(trailing).strip()
-                if trailing_txt:
-                    thoughts.append(trailing_txt)
-
-            found_files.append((first_fname, "\n".join(final_code).strip()))
+            for idx, (m_i, m_fname, m_tag) in enumerate(matches):
+                start_c = m_i + 2
+                end_c = matches[idx + 1][0] if idx + 1 < len(matches) else len(lines)
+                raw_code = lines[start_c:end_c]
+                code_txt = "\n".join(raw_code).strip()
+                if code_txt:
+                    found_files.append((m_fname, code_txt))
         else:
             # Case B: Filename and TAG are at the BOTTOM of code
             prev_idx = 0
             for card_idx, fname, tag in matches:
                 content_lines = lines[prev_idx:card_idx]
                 content = "\n".join(content_lines).strip()
-                parts = re.split(r"\n{2,}", content)
-                if len(parts) > 1 and not is_code_line(parts[0]):
-                    intro = parts[0].strip()
-                    if intro:
-                        thoughts.append(intro)
-                    clean_content = "\n\n".join(parts[1:]).strip()
-                else:
-                    clean_content = content
-                found_files.append((fname, clean_content))
+                intro, clean_content = clean_bottom_card_content(content)
+                if intro:
+                    thoughts.append(intro)
+                if clean_content:
+                    found_files.append((fname, clean_content))
                 prev_idx = card_idx + 2
 
             if prev_idx < len(lines):
@@ -1637,25 +1691,6 @@ def _detect_tool_calls(reply: str, tool_names: set, cwd: str) -> Tuple[str, List
         if os.path.isfile(local_path) and ("Read" in tool_names or "FileRead" in tool_names):
             t_name = "Read" if "Read" in tool_names else "FileRead"
             return f"Reading `{missing_name}` from your computer.", [(t_name, {"file_path": local_path})]
-
-    # 0b. Check if Muse reported its own remote server workspace directories
-    cloud_workspace_indicators = [
-        "banana.txt", "cherry.txt", "apple.txt",
-        "top of my workspace", "my workspace", "in my workspace", "of my workspace",
-        "my own workspace", "skipping internal system folders", "internal system folders",
-        "cron.d", "onboarding_tour", "self_improvement", "spaces/", "your_files",
-        "in workspace:", "not on your local pc"
-    ]
-    reply_lower = clean_reply.lower()
-    if any(ind in reply_lower for ind in cloud_workspace_indicators):
-        if "Glob" in tool_names:
-            return "Checking the actual files in your local working directory on your computer.", [("Glob", {"pattern": "*"})]
-        elif "PowerShell" in tool_names:
-            return "Listing files in your local folder.", [("PowerShell", {"command": "Get-ChildItem -Name"})]
-        elif "Bash" in tool_names:
-            return "Listing files in your local folder.", [("Bash", {"command": "ls"})]
-        else:
-            return _format_file_list(list_local_files(cwd), cwd), []
 
     # 0c. Check if Muse states it cannot read a file or needs to read a local file
     m_cant_read = re.search(
@@ -1758,6 +1793,19 @@ def _detect_tool_calls(reply: str, tool_names: set, cwd: str) -> Tuple[str, List
 
         # Normal text block (thought / commentary)
         thoughts.append(block)
+
+    # 0b. Fallback: ONLY check if Muse reported its own remote server workspace directories
+    # IF NO other actions/tools were generated!
+    if not tools:
+        cloud_dummy_files = ["banana.txt", "cherry.txt", "apple.txt", "cron.d", "onboarding_tour", "self_improvement", "spaces/"]
+        reply_lower = clean_reply.lower()
+        if any(dummy in reply_lower for dummy in cloud_dummy_files):
+            if "Glob" in tool_names:
+                return "Checking the actual files in your local working directory on your computer.", [("Glob", {"pattern": "*"})]
+            elif "PowerShell" in tool_names:
+                return "Listing files in your local folder.", [("PowerShell", {"command": "Get-ChildItem -Name"})]
+            elif "Bash" in tool_names:
+                return "Listing files in your local folder.", [("Bash", {"command": "ls"})]
 
     thought_str = "\n\n".join(thoughts).strip()
     if not thought_str and tools:
@@ -2212,6 +2260,8 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                         f"{file_context_str}\n\n"
                                         f"Please analyze the user's local files above to answer their question:"
                                     )
+                            elif is_title_generation_query(clean_last_user_msg):
+                                prompt_to_send = clean_last_user_msg
                             elif re.search(r"\b(?:create|make|write|generate|build|implement|develop|platform|architecture|code|deliverable|deliverables|spec|specification|transfer|save|disk|export)\b", clean_last_user_msg, flags=re.IGNORECASE):
                                 prompt_to_send = (
                                     f"{clean_last_user_msg}\n\n"
@@ -2230,23 +2280,40 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                 return
 
                             # Check if Muse hallucinated putting files into ~/workspace or background execution
-                            for retry_attempt in range(2):
-                                if not is_workspace_promise(reply) or extracted_files:
-                                    break
-                                print(f"[*] Detected workspace promise from Muse (attempt {retry_attempt + 1}/2); automatically re-prompting for direct code output...", file=sys.stderr, flush=True)
-                                retry_prompt = (
-                                    "I need the project on my local computer. Please package all files from your workspace as a downloadable archive (tar.gz or zip), "
-                                    "or output the files with their filenames and complete code in markdown code blocks, so the automated harness can extract or save them to disk immediately."
-                                )
-                                try:
-                                    retry_reply, retry_extracted = send_with_keepalive(retry_prompt, cwd=cwd)
-                                    if retry_reply:
-                                        reply = retry_reply
-                                    if retry_extracted:
-                                        extracted_files = retry_extracted
-                                except Exception as ex:
-                                    print(f"[!] Error on workspace promise retry: {ex}", file=sys.stderr, flush=True)
-                                    break
+                            if not is_title_generation_query(clean_last_user_msg):
+                                for retry_attempt in range(2):
+                                    if not is_workspace_promise(reply) or extracted_files:
+                                        break
+                                    print(f"[*] Detected workspace promise from Muse (attempt {retry_attempt + 1}/2); automatically re-prompting for direct code output...", file=sys.stderr, flush=True)
+                                    is_multi_file_project = bool(
+                                        re.search(
+                                            r"\b(?:platform|entire project|full project|multi-file|full stack|scaffold|repository|codebase|archive|tar\.gz|zip)\b",
+                                            clean_last_user_msg,
+                                            flags=re.IGNORECASE,
+                                        )
+                                    )
+                                    if is_multi_file_project:
+                                        retry_prompt = (
+                                            "I need the project on my local computer. Please package all files from your workspace as a downloadable archive (tar.gz or zip), "
+                                            "or output the files with their filenames and complete code in markdown code blocks, so the automated harness can extract or save them to disk immediately."
+                                        )
+                                    else:
+                                        m_fn = re.search(r"\b([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]{1,6})\b", clean_last_user_msg)
+                                        fn_mention = f" for `{m_fn.group(1)}`" if m_fn else ""
+                                        ext_mention = m_fn.group(1).split(".")[-1] if m_fn else ""
+                                        retry_prompt = (
+                                            f"Please output the complete, raw content{fn_mention} directly in your chat response inside a markdown code block "
+                                            f"(```{ext_mention} ... ```). Do not package it as an archive or keep it in a private workspace."
+                                        )
+                                    try:
+                                        retry_reply, retry_extracted = send_with_keepalive(retry_prompt, cwd=cwd)
+                                        if retry_reply:
+                                            reply = retry_reply
+                                        if retry_extracted:
+                                            extracted_files = retry_extracted
+                                    except Exception as ex:
+                                        print(f"[!] Error on workspace promise retry: {ex}", file=sys.stderr, flush=True)
+                                        break
 
                             if extracted_files:
                                 file_list_preview = "\n".join(f"- `{f}`" for f in sorted(extracted_files[:25]))
@@ -2468,7 +2535,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                     return
 
                 try:
-                    reply = mgr.send_prompt(last_user_msg)
+                    reply, _ = mgr.send_prompt(last_user_msg)
                     resp = {
                         "id": f"chatcmpl-muse-{int(time.time())}",
                         "object": "chat.completion",
