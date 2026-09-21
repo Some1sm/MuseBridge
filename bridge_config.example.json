@@ -1,0 +1,20 @@
+{
+  "chat_url": "",
+  "port": 8765,
+  "headless": true,
+  "timeout": 240,
+  "proxy": "",
+  "cdp_url": "",
+  "geolocation": {
+    "latitude": 40.7128,
+    "longitude": -74.006
+  },
+  "locale": "en-US",
+  "timezone_id": "America/New_York",
+  "selectors": {
+    "composer": "textarea[placeholder='Message'], textarea",
+    "send_button": "button[aria-label='Send'], button[aria-label*='Send' i]",
+    "message_list": "main, [role='log'], div[class*='chat' i]",
+    "message": ".hatch-chat-groupable-bubble"
+  }
+}

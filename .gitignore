@@ -1,0 +1,42 @@
+# Authentication & Credentials
+storage_state.json
+bridge_config.json
+claude_request_sample.json
+*.session.json
+*.cookie*
+*.token*
+
+# Screenshots & Debug Dumps
+debug_*
+*.png
+*.jpg
+*.jpeg
+*.log
+*.html
+scratch/
+
+# Archives & Transferred Packages
+*.tar.gz
+*.zip
+*.tar
+*.tgz
+
+# Temporary test files
+banana.txt
+fibonacci.py
+yourmom.txt
+test_*.txt
+test_*.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Claude Code & IDE
+.claude/
+.idea/
+.vscode/
