@@ -467,6 +467,18 @@ def _wait_for_reply(
         if not assistant_msgs:
             if poll_count % 8 == 0:
                 print(f"[*] Waiting for assistant bubble... (DOM bubbles={len(msgs)}, n_before={n_before}, matched_user={matched_user_idx})", file=sys.stderr, flush=True)
+                try:
+                    conn_elem = page.locator("text='Still sending', text='Connecting...'")
+                    if conn_elem.count() > 0 and conn_elem.first.is_visible():
+                        print(
+                            "\n[!] ALERT: Muse session expired or disconnected ('Connecting...' / 'Still sending' detected).\n"
+                            "    Your login session in storage_state.json has expired.\n"
+                            "    Please refresh it by running: python muse_bridge.py login\n",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                except Exception:
+                    pass
             continue
 
         BUBBLE_SEP = "\n\n<!-- bubble -->\n\n"
